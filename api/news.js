@@ -3,56 +3,76 @@ const https = require('https');
 
 function fetchUrl(url) {
   return new Promise((resolve, reject) => {
-    https.get(url, { headers: { 'User-Agent': 'Mozilla/5.0' } }, (res) => {
+    const req = https.get(url, {
+      headers: { 'User-Agent': 'Mozilla/5.0' }
+    }, (res) => {
       let data = '';
       res.on('data', chunk => data += chunk);
       res.on('end', () => {
-        try { resolve(JSON.parse(data)); }
-        catch(e) { reject(e); }
+        try { resolve({ ok: res.statusCode === 200, body: JSON.parse(data) }); }
+        catch(e) { resolve({ ok: false, body: null }); }
       });
-    }).on('error', reject);
+    });
+    req.on('error', (e) => resolve({ ok: false, body: null, err: e.message }));
+    req.setTimeout(12000, () => { req.destroy(); resolve({ ok: false, body: null, err: 'timeout' }); });
   });
 }
 
+// Single broad query — more reliable than multiple narrow ones
 const QUERIES = [
-  { q: 'Iran OR Israel OR nuclear OR war OR Ukraine OR Gaza OR conflict OR ceasefire OR "military operation"', label: 'CONFLICT/WAR', timespan: '4h' },
-  { q: 'sanctions OR OFAC OR SDN OR "dark fleet" OR "oil embargo" OR "export control" OR tariff OR "trade war"', label: 'SANCTIONS/TRADE', timespan: '4h' },
-  { q: 'shipping OR "Red Sea" OR "Strait of Hormuz" OR "Suez Canal" OR vessel OR port OR blockade OR pipeline', label: 'SHIPPING/INFRA', timespan: '4h' },
-  { q: '"crude oil" OR "natural gas" OR gold OR copper OR "supply chain" OR PMI OR inflation OR "central bank"', label: 'COMMODITIES/MACRO', timespan: '4h' }
+  'geopolitical conflict war sanctions',
+  'oil energy market economy inflation',
+  'trade tariff military diplomacy'
 ];
 
 async function fetchQuery(q) {
-  const url = `https://api.gdeltproject.org/api/v2/doc/doc?query=${encodeURIComponent(q.q)}&mode=artlist&maxrecords=10&timespan=${q.timespan}&sourcelang=english&format=json`;
-  try {
-    const data = await fetchUrl(url);
-    if (!data || !data.articles) return [];
-    return data.articles.map(a => ({
-      title: (a.title || '').slice(0, 85),
-      url: a.url || '',
-      domain: (a.domain || q.label).replace(/^www\./, ''),
-      seendate: a.seendate || '',
-      label: q.label
-    })).filter(a => a.title);
-  } catch(e) { return []; }
+  const url = 'https://api.gdeltproject.org/api/v2/doc/doc'
+    + '?query=' + encodeURIComponent(q)
+    + '&mode=artlist'
+    + '&maxrecords=10'
+    + '&timespan=24h'
+    + '&sort=datedesc'
+    + '&sourcelang=english'
+    + '&format=json';
+
+  const result = await fetchUrl(url);
+  if (!result.ok || !result.body || !result.body.articles) return [];
+
+  return result.body.articles.map(a => ({
+    title:    (a.title || '').replace(/[<>]/g, '').trim().slice(0, 90),
+    url:      a.url || '',
+    domain:   (a.domain || '').replace(/^www\./, ''),
+    seendate: a.seendate || '',
+    label:    q.split(' ')[0].toUpperCase()
+  })).filter(a => a.title && a.url);
 }
 
 module.exports = async function handler(req, res) {
   res.setHeader('Access-Control-Allow-Origin', '*');
-  res.setHeader('Access-Control-Allow-Methods', 'GET, OPTIONS');
-  res.setHeader('Cache-Control', 's-maxage=180, stale-while-revalidate');
+  res.setHeader('Cache-Control', 's-maxage=300, stale-while-revalidate=600');
 
   if (req.method === 'OPTIONS') { res.status(200).end(); return; }
 
   try {
-    const results = await Promise.all(QUERIES.map(fetchQuery));
-    const all = results.flat();
+    // Run queries sequentially to avoid overwhelming GDELT
+    let all = [];
+    for (const q of QUERIES) {
+      const articles = await fetchQuery(q);
+      all = all.concat(articles);
+    }
+
+    // Deduplicate by URL
     const seen = new Set();
     const deduped = all.filter(a => {
-      if (seen.has(a.url)) return false;
+      if (!a.url || seen.has(a.url)) return false;
       seen.add(a.url); return true;
     });
-    res.status(200).json({ articles: deduped, ts: Date.now() });
+
+    // Sort by date descending
+    deduped.sort((a, b) => (b.seendate || '').localeCompare(a.seendate || ''));
+
+    res.status(200).json({ articles: deduped, count: deduped.length, ts: Date.now() });
   } catch(e) {
-    res.status(500).json({ error: e.message, articles: [] });
+    res.status(500).json({ error: e.message, articles: [], count: 0 });
   }
 };
