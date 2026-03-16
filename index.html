@@ -3632,55 +3632,45 @@ document.addEventListener('DOMContentLoaded', function() {
     });
   }
 
-  // ── MAIN FETCH — /api/news (Vercel) → GDELT direct → RSS JSONP ──
+  // ── MAIN FETCH — AI primary, RSS+GDELT fallback ──────────
   async function fetchAllSignals() {
     seenUrls = new Set();
-    setStatus('FETCHING NEWS...', '#ffd700');
+
+    // AI first — works from file://, http://, https://, everywhere
+    var aiOk = await fetchSignalsAI();
+    if(aiOk) return;
+
+    // Fallback: RSS via JSONP
+    setStatus('FETCHING RSS...', '#ffd700');
     try {
-      // Try Vercel serverless proxy first (works on vercel.app)
-      var apiRes = await fetch('/api/news', {cache:'no-store'}).catch(function(){ return null; });
-      if(apiRes && apiRes.ok) {
-        var apiData = await apiRes.json();
-        if(apiData && apiData.articles && apiData.articles.length > 0) {
-          var all = apiData.articles.map(function(a){
-            var cls = classify(a.title);
-            return { level:cls.level, tag:cls.tag, title:truncate(a.title,85),
-                     body:'→ '+a.domain+' · '+a.label, source:a.domain,
-                     link:a.url, age:0 };
-          });
-          all.sort(function(a,b){ var lv={high:0,med:1,low:2}; return (lv[a.level]||2)-(lv[b.level]||2); });
-          lastRefresh = new Date();
-          setStatus('LIVE · '+lastRefresh.toLocaleTimeString('it-IT',{hour:'2-digit',minute:'2-digit',second:'2-digit'})+' · GDELT', '#00c896');
-          rebuildFeed(all.slice(0, MAX_SIGNALS));
-          return;
-        }
-      }
+      var results = await Promise.all(RSS_FEEDS.map(fetchRSSJsonp));
+      var all = [].concat.apply([], results);
 
-      // Fallback: GDELT direct (works on HTTP servers with CORS *)
+      // Also try GDELT when served from HTTP
       if(window.location.protocol !== 'file:') {
-        var results = await Promise.all(QUERIES.map(fetchGdelt));
-        var gdeltAll = [].concat.apply([], results);
-        if(gdeltAll.length > 0) {
-          gdeltAll.sort(function(a,b){ var lv={high:0,med:1,low:2}; return (lv[a.level]||2)-(lv[b.level]||2); });
-          lastRefresh = new Date();
-          setStatus('LIVE · '+lastRefresh.toLocaleTimeString('it-IT',{hour:'2-digit',minute:'2-digit',second:'2-digit'})+' · GDELT', '#00c896');
-          rebuildFeed(gdeltAll.slice(0, MAX_SIGNALS));
-          return;
-        }
+        try {
+          var gdeltResults = await Promise.all(QUERIES.map(fetchGdelt));
+          all = all.concat([].concat.apply([], gdeltResults));
+        } catch(e) {}
       }
 
-      // Last fallback: RSS JSONP (works from file://)
-      var rssResults = await Promise.all(RSS_FEEDS.map(fetchRSSJsonp));
-      var rssAll = [].concat.apply([], rssResults);
-      if(rssAll.length > 0) {
-        rssAll.sort(function(a,b){ var lv={high:0,med:1,low:2}; return (lv[a.level]||2)-(lv[b.level]||2); });
-        lastRefresh = new Date();
-        setStatus('LIVE · '+lastRefresh.toLocaleTimeString('it-IT',{hour:'2-digit',minute:'2-digit',second:'2-digit'})+' · RSS', '#00c896');
-        rebuildFeed(rssAll.slice(0, MAX_SIGNALS));
-        return;
-      }
+      all.sort(function(a,b){
+        var lv = {high:0, med:1, low:2};
+        return (lv[a.level]||2) - (lv[b.level]||2);
+      });
 
-      setStatus('FEED OFFLINE · seeds shown', '#ff6b35');
+      var seenTitles = new Set();
+      all = all.filter(function(a){
+        var key = a.title.slice(0,40).toLowerCase();
+        if(seenTitles.has(key)) return false;
+        seenTitles.add(key); return true;
+      });
+
+      if(all.length === 0){ setStatus('FEED OFFLINE · seeds shown', '#ff6b35'); return; }
+
+      lastRefresh = new Date();
+      setStatus('LIVE · '+lastRefresh.toLocaleTimeString('it-IT',{hour:'2-digit',minute:'2-digit',second:'2-digit'})+' · RSS', '#00c896');
+      rebuildFeed(all.slice(0, MAX_SIGNALS));
     } catch(e) {
       setStatus('FEED ERR · seeds shown', '#ff6b35');
     }
@@ -3947,39 +3937,28 @@ document.addEventListener('DOMContentLoaded', function() {
 
   // ── VIX — Yahoo Finance (free, no key, CORS via allorigins proxy) ──
   async function fetchVIX() {
-    try {
-      // On Vercel: use serverless proxy /api/vix (no CORS)
-      // Locally: fallback to direct proxies
-      var endpoints = [
-        '/api/vix',
-        'https://api.allorigins.win/raw?url=' + encodeURIComponent('https://query1.finance.yahoo.com/v8/finance/chart/%5EVIX?interval=1m&range=1d'),
-        'https://corsproxy.io/?' + encodeURIComponent('https://query1.finance.yahoo.com/v8/finance/chart/%5EVIX?interval=1m&range=1d')
-      ];
-      for(var i=0; i<endpoints.length; i++) {
-        try {
-          var res = await fetch(endpoints[i], {cache:'no-store'});
-          if(!res.ok) continue;
-          var data = await res.json();
-          // /api/vix returns {price, open} — Yahoo returns full chart object
-          var price, open;
-          if(data.price) {
-            price = parseFloat(data.price);
-            open  = parseFloat(data.open) || price;
-          } else {
-            var meta = data && data.chart && data.chart.result && data.chart.result[0] && data.chart.result[0].meta;
-            if(!meta) continue;
-            price = meta.regularMarketPrice || meta.previousClose;
-            open  = meta.chartPreviousClose || meta.previousClose || price;
-          }
-          if(!price || isNaN(price)) continue;
-          applyVix(price, open);
-          var pct = open ? ((price - open) / open * 100) : 0;
-          updateTape('vix', price, pct);
-          return;
-        } catch(e) { /* try next */ }
-      }
-    } catch(e) {}
-    // Synthetic fallback from SPX movement
+    var proxies = [
+      'https://api.allorigins.win/raw?url=',
+      'https://corsproxy.io/?'
+    ];
+    var yahooUrl = 'https://query1.finance.yahoo.com/v8/finance/chart/%5EVIX?interval=1m&range=1d';
+    for(var i=0; i<proxies.length; i++) {
+      try {
+        var res = await fetch(proxies[i] + encodeURIComponent(yahooUrl), {cache:'no-store'});
+        if(!res.ok) continue;
+        var data = await res.json();
+        var meta = data && data.chart && data.chart.result && data.chart.result[0] && data.chart.result[0].meta;
+        if(!meta) continue;
+        var price = meta.regularMarketPrice || meta.previousClose;
+        if(!price || isNaN(price)) continue;
+        var open  = meta.chartPreviousClose || meta.previousClose || price;
+        applyVix(price, open);
+        var pct = open ? ((price - open) / open * 100) : 0;
+        updateTape('vix', price, pct);
+        return; // success — stop trying proxies
+      } catch(e) { /* try next proxy */ }
+    }
+    // All proxies failed — use synthetic fallback from SPX
     if(prices.spx && prices.spx.val !== prices.spx.open) {
       var spxChgPct = ((prices.spx.val - prices.spx.open) / prices.spx.open) * 100;
       var vixEst = prices.vix.open * (1 - spxChgPct * 0.04);
